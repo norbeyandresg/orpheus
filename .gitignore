@@ -6,6 +6,19 @@ __pycache__/
 # C extensions
 *.so
 
+# Notebook files
+*.ipynb
+
+# Macbook
+.DS_Store
+
+# Default download path
+./downloads
+
+# Google related
+g-creds.json
+oauth.json
+
 # Distribution / packaging
 .Python
 build/
