@@ -29,12 +29,9 @@ def get_user_playlists() -> List[str] | None:
 def download_playlists(playlist_ids: List[str]) -> None:
     for p_id in playlist_ids:
         playlist = orp.get_playlist_details(p_id)
-        # playlists.append(playlist)
         orp.download_playlist_tracks(playlist)
         orp.cleanup_missing_tracks_from_playlist(playlist)
         orp.create_m3u8_playlist_file(playlist.get("title", "default"))
-
-    # o.cleanup_missing_tracks(playlists)
 
 
 def main() -> None:
