@@ -1,6 +1,6 @@
 import os
 import re
-from typing import List
+from typing import Dict, List, Set
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
@@ -12,7 +12,12 @@ load_dotenv()
 
 
 class Orpheus:
-    def __init__(self):
+    ytmusic: YTMusic
+    library_path: str
+    archive: Set
+    m3u8_data: List[str]
+
+    def __init__(self) -> None:
         # load credentials
         _client_id = os.environ.get("YTM_CLIENT_ID", "")
         _client_secret = os.environ.get("YTM_CLIENT_SECRET", "")
@@ -36,19 +41,19 @@ class Orpheus:
             lines = [f"youtube {track_id}\n" for track_id in self.archive]
             f.writelines(lines)
 
-    def get_playlists(self):
+    def get_playlists(self) -> List[Dict]:
         return self.ytmusic.get_library_playlists()
 
-    def get_playlist_details(self, playlist_id: str):
+    def get_playlist_details(self, playlist_id: str) -> Dict:
         return self.ytmusic.get_playlist(playlistId=playlist_id, limit=None)
 
-    def create_m3u8_playlist_file(self, playlist_name: str):
+    def create_m3u8_playlist_file(self, playlist_name: str) -> None:
         with open(f"{self.library_path}/{playlist_name}.m3u8", "w") as f:
             f.writelines(self.m3u8_data)
 
         self.m3u8_data = ["#EXTM3U\n"]
 
-    def get_ydl_opts(self):
+    def get_ydl_opts(self) -> Dict:
         return {
             "format": "bestaudio/best",
             "outtmpl": f"{self.library_path}/%(id)s.%(ext)s",
@@ -64,7 +69,7 @@ class Orpheus:
             ],
         }
 
-    def download_playlist_tracks(self, playlist: dict):
+    def download_playlist_tracks(self, playlist: dict) -> None:
         tracks = playlist.get("tracks", [])
         base_url = "https://www.youtube.com/watch?v="
 
@@ -78,27 +83,34 @@ class Orpheus:
                     f"#EXTINF:{track.get('duration_seconds', '-1')},{track.get('title')}\n",
                     f"{self.library_path}/{track.get('title')} [{track.get('videoId')}].mp3\n",
                 ]
-                # self.m3u8_data.append(f"{track.get('title')}.mp3\n")
                 self.m3u8_data.extend(entry)
 
-    def cleanup_missing_tracks(self, playlists: List[dict]):
+    def cleanup_missing_tracks_from_playlist(self, playlist: dict) -> None:
+        self.load_download_archive()
         pattern = re.compile(r"\[(.*?)\]\.mp3$", re.IGNORECASE)
+        upstream_tracks = {track.get("videoId") for track in playlist.get("tracks", [])}
+        local_tracks = []
 
-        upstream_tracks = set()
+        # load local
+        with open(f"{self.library_path}/{playlist.get('title')}.m3u8", "a+") as f:
+            f.seek(0)
+            lines = f.readlines()
+            local_tracks = {
+                line.replace("[", "]").split("]")[-2]
+                for line in lines
+                if "#EXT" not in line
+            }
 
-        for playlist in playlists:
-            upstream_tracks.update(
-                {track.get("videoId") for track in playlist.get("tracks", [])}
-            )
+        missing_tracks = local_tracks - upstream_tracks
 
-        print(f"Upstream tracks: {len(upstream_tracks)}")
+        print(f"Removing {len(missing_tracks)} tracks")
         with os.scandir(self.library_path) as entries:
             for entry in entries:
                 if entry.is_file() and entry.name.lower().endswith(".mp3"):
                     match = pattern.search(entry.name)
                     if match:
                         track_id = match.group(1)
-                        if track_id not in upstream_tracks:
+                        if track_id in missing_tracks:
                             try:
                                 os.remove(entry.path)
                                 self.archive.remove(track_id)
@@ -108,18 +120,4 @@ class Orpheus:
                     else:
                         print(f"Skipping file with unrecognized format: {entry.name}")
 
-
-if __name__ == "__main__":
-    o: Orpheus = Orpheus()
-    upstream_playlists: List[dict] = o.get_playlists()
-    playlists: List[dict] = []
-    for p in upstream_playlists:
-        p_id = p.get("playlistId")
-        if not p_id:
-            continue
-        playlist = o.get_playlist_details(p_id)
-        playlists.append(playlist)
-        o.download_playlist_tracks(playlist)
-        o.create_m3u8_playlist_file(playlist.get("title", "default"))
-
-    o.cleanup_missing_tracks(playlists)
+        self.update_download_archive()

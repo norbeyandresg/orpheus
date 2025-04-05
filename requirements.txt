@@ -1,6 +1,6 @@
 python-dotenv==1.0.1
 ytmusicapi==1.10.1
-yt_dlp==2025.1.15
+yt_dlp==2025.3.31
 eyed3==0.9.7
 ruff==0.9.3
 yaspin==3.1.0

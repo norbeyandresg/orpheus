@@ -2,13 +2,14 @@ import os
 from dotenv import load_dotenv
 from yt_dlp import postprocessor
 import eyed3
+from typing import Tuple, List, Dict
 
 # load environment variables
 load_dotenv()
 
 
 class AddTrackMetadataPP(postprocessor.PostProcessor):
-    def run(self, information):
+    def run(self, information: Dict) -> Tuple[List, Dict]:
         # set library path
         self.library_path = os.environ.get("LIBRARY_PATH", "./downloads")
         self.to_screen("Injecting metadata")
@@ -33,7 +34,7 @@ class AddTrackMetadataPP(postprocessor.PostProcessor):
 
         # Update downloaded file name
         src = f"{self.library_path}/{information.get('id')}.mp3"
-        dst = f"{self.library_path}/{information.get('title')} [{information.get('id')}].mp3"
+        dst = f"{self.library_path}/{information.get('title', '').replace('/', '-')} [{information.get('id')}].mp3"
         os.rename(src, dst)
 
         return [], information
