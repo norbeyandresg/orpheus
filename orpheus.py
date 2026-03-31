@@ -106,7 +106,7 @@ class Orpheus:
         self.m3u8_tracks = []
 
     def get_ydl_opts(self) -> Dict:
-        return {
+        opts = {
             "format": "bestaudio/best",
             "outtmpl": f"{self.library_path}/%(id)s.%(ext)s",
             "ignoreerrors": True,
@@ -131,7 +131,18 @@ class Orpheus:
                 "EmbedThumbnail+ffmpeg_o": ["-c:v", "mjpeg", "-vf", "crop=ih:ih"],
                 "FFmpegMetadata+ffmpeg_o": ["-metadata", "genre="],
             },
+            # Anti-bot and rate-limiting options
+            "sleep_interval": 5,
+            "max_sleep_interval": 10,
         }
+
+        # Use cookies if available to bypass 429/bot detection
+        cookies_path = os.path.join(os.getcwd(), "cookies.txt")
+        if os.path.exists(cookies_path):
+            opts["cookiefile"] = cookies_path
+            print(f"Using cookies from: {cookies_path}")
+        
+        return opts
 
     def download_playlist_tracks(self, playlist: dict) -> None:
         tracks = playlist.get("tracks", [])
