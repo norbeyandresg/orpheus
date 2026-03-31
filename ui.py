@@ -39,6 +39,7 @@ def main() -> None:
     playlists_ids = get_user_playlists()
     if playlists_ids:
         download_playlists(playlists_ids)
+        orp.cleanup_removed_playlists()
 
 
 if __name__ == "__main__":

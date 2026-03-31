@@ -14,6 +14,7 @@ class AddTrackMetadataPP(postprocessor.PostProcessor):
         self.library_path = os.environ.get("LIBRARY_PATH", "./downloads")
         self.to_screen("Injecting metadata")
 
+        print(f"track info: {information}\n")
         audiofile = eyed3.load(f"{self.library_path}/{information.get('id')}.mp3")
 
         # ensure audio file is loaded
@@ -31,10 +32,5 @@ class AddTrackMetadataPP(postprocessor.PostProcessor):
         audiofile.tag.artist = information.get("artists", [""])[0]
 
         audiofile.tag.save()
-
-        # Update downloaded file name
-        src = f"{self.library_path}/{information.get('id')}.mp3"
-        dst = f"{self.library_path}/{information.get('title', '').replace('/', '-')} [{information.get('id')}].mp3"
-        os.rename(src, dst)
 
         return [], information

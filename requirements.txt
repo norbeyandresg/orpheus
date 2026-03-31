@@ -6,3 +6,4 @@ ruff==0.9.3
 yaspin==3.1.0
 questionary==2.1.0
 art==6.4
+textual>=0.70.0
