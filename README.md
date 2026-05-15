@@ -48,6 +48,14 @@ To run Orpheus and start synchronizing your playlists:
    python ui.py
    ```
 
+### Automated Sync (CLI)
+
+If you want to sync all your playlists at once without selecting them manually, you can use the sync script:
+
+   ```bash
+   python sync.py
+   ```
+
 2. **Authenticate with YouTube Music**: Upon running the application for the first time, you'll be prompted to authenticate with your YouTube Music account. Follow the on-screen instructions to complete the authentication process.
 
 3. **Select Playlists to Sync**: After authentication, Orpheus will display a list of your YouTube Music playlists. Use the interface to select the playlists you wish to download.

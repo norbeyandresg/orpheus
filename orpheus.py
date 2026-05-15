@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
 from ytmusicapi.auth.oauth.credentials import OAuthCredentials
-from postprocessors import AddTrackMetadataPP
+from postprocessors import BeetsPostProcessor
 
 # load environment variables
 load_dotenv()
@@ -110,7 +110,7 @@ class Orpheus:
             "format": "bestaudio/best",
             "outtmpl": f"{self.library_path}/%(id)s.%(ext)s",
             "ignoreerrors": True,
-            "writethumbnail": True,  # 1. Downloads the image
+            "writethumbnail": True,
             "noplaylist": True,
             "download_archive": f"{self.library_path}/download_archive.txt",
             "remote_components": ["ejs:github"],
@@ -121,17 +121,16 @@ class Orpheus:
                     "preferredquality": "320",
                 },
                 {
-                    "key": "EmbedThumbnail",  # 2. Injects it into the track
+                    "key": "EmbedThumbnail",
                 },
                 {
-                    "key": "FFmpegMetadata",  # 3. Adds title/artist tags too
+                    "key": "FFmpegMetadata",
                 },
             ],
             "postprocessor_args": {
-                "EmbedThumbnail+ffmpeg_o": ["-c:v", "mjpeg", "-vf", "crop=ih:ih"],
-                "FFmpegMetadata+ffmpeg_o": ["-metadata", "genre="],
+                "thumbnailsconvertor+ffmpeg_o": ["-c:v", "mjpeg", "-vf", "crop=ih:ih"],
+                "metadata+ffmpeg_o": ["-metadata", "genre="],
             },
-            # Anti-bot and rate-limiting options
             "sleep_interval": 5,
             "max_sleep_interval": 10,
         }
@@ -141,7 +140,7 @@ class Orpheus:
         if os.path.exists(cookies_path):
             opts["cookiefile"] = cookies_path
             print(f"Using cookies from: {cookies_path}")
-        
+
         return opts
 
     def download_playlist_tracks(self, playlist: dict) -> None:
@@ -150,8 +149,7 @@ class Orpheus:
 
         print(f"Processing {len(tracks)} from playlist {playlist.get('title')}")
         with YoutubeDL(self.get_ydl_opts()) as ydl:
-            # ydl.add_post_processor(AddTrackMetadataPP(), when="post_process")
-
+            ydl.add_post_processor(BeetsPostProcessor())
             for track in tracks:
                 ydl.download(f"{base_url}{track.get('videoId')}")
                 # Store track metadata for playlist generation
@@ -168,7 +166,6 @@ class Orpheus:
         upstream_tracks = {track.get("videoId") for track in playlist.get("tracks", [])}
         local_tracks = set()
 
-        # load local
         # load from library playlist (which has local paths)
         playlist_file = os.path.join(
             self.library_playlist_path, f"{playlist.get('title')}.m3u8"
@@ -203,7 +200,6 @@ class Orpheus:
                                 print(f"Error deleting {entry.path}: {e}")
                     else:
                         pass
-                        # print(f"Skipping file with unrecognized format: {entry.name}")
 
         self.update_download_archive()
 
