@@ -2,56 +2,59 @@
 import sys
 from art import text2art
 from orpheus import Orpheus
+from logger_setup import setup_logger
+
+# Initialize logger
+logger = setup_logger("OrpheusSync")
 
 def main():
+    # We still print the ASCII art to stdout for manual runs
     print(text2art("Orpheus Sync", "italic"))
     
-    print("Initializing Orpheus...")
+    logger.info("Starting Orpheus Sync...")
+    
     try:
         orp = Orpheus()
-        print("✔ Initialized")
+        logger.info("Orpheus initialized successfully")
     except Exception as e:
-        print(f"✘ Error initializing Orpheus: {e}")
+        logger.error(f"Error initializing Orpheus: {e}")
         sys.exit(1)
 
-    print("Loading all user playlists...")
     try:
         upstream_playlists = orp.get_playlists()
-        print(f"✔ Found {len(upstream_playlists)} playlists")
+        logger.info(f"Found {len(upstream_playlists)} playlists in library")
     except Exception as e:
-        print(f"✘ Error loading playlists: {e}")
+        logger.error(f"Error loading playlists: {e}")
         sys.exit(1)
 
     if not upstream_playlists:
-        print("No playlists found.")
+        logger.warning("No playlists found in your library.")
         return
-
-    print("Starting sync...")
 
     for p in upstream_playlists:
         title = p.get("title", "Unknown")
         p_id = p.get("playlistId")
         
-        print(f"\n--- Syncing Playlist: {title} ({p_id}) ---")
+        logger.info(f"--- Syncing Playlist: {title} ({p_id}) ---")
         
         try:
-            print(f"Fetching details for {title}...")
+            logger.info(f"Fetching details for {title}...")
             playlist = orp.get_playlist_details(p_id)
-            print("✔ Details fetched")
             
             orp.download_playlist_tracks(playlist)
             orp.cleanup_missing_tracks_from_playlist(playlist)
             orp.create_m3u8_playlist_file(title)
+            logger.info(f"Successfully synced playlist: {title}")
             
         except Exception as e:
-            print(f"✘ Error syncing playlist {title}: {e}")
+            logger.error(f"Error syncing playlist {title}: {e}")
 
-    print("\n--- Final Cleanup ---")
+    logger.info("Performing final cleanup...")
     try:
         orp.cleanup_removed_playlists()
-        print("Done!")
+        logger.info("Sync process completed successfully!")
     except Exception as e:
-        print(f"✘ Error during final cleanup: {e}")
+        logger.error(f"Error during final cleanup: {e}")
 
 if __name__ == "__main__":
     main()

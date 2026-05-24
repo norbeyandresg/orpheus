@@ -6,6 +6,10 @@ from dotenv import load_dotenv
 from yt_dlp import postprocessor
 import eyed3
 from typing import Tuple, List, Dict
+from logger_setup import setup_logger
+
+# Initialize logger
+logger = setup_logger("OrpheusPP")
 
 # load environment variables
 load_dotenv()
@@ -15,7 +19,7 @@ class AddTrackMetadataPP(postprocessor.PostProcessor):
     def run(self, information: Dict) -> Tuple[List, Dict]:
         # set library path
         self.library_path = os.environ.get("LIBRARY_PATH", "./downloads")
-        self.to_screen("Injecting metadata")
+        logger.info(f"Injecting metadata for track {information.get('id')}")
 
         audiofile = eyed3.load(f"{self.library_path}/{information.get('id')}.mp3")
 
@@ -44,10 +48,10 @@ class BeetsPostProcessor(postprocessor.PostProcessor):
         track_path = os.path.join(self.library_path, f"{information.get('id')}.mp3")
 
         if not os.path.exists(track_path):
-            self.to_screen(f"Track file not found: {track_path}")
+            logger.warning(f"Track file not found for beets: {track_path}")
             return [], information
 
-        self.to_screen(f"Running beets post-processor for: {track_path}")
+        logger.info(f"Running beets post-processor for: {track_path}")
 
         # Define beets config
         beets_config = {
@@ -93,12 +97,12 @@ class BeetsPostProcessor(postprocessor.PostProcessor):
             )
 
             if result.returncode != 0:
-                self.to_screen(f"Beets error: {result.stderr}")
+                logger.error(f"Beets error for {track_path}: {result.stderr}")
             else:
-                self.to_screen("Beets processing completed successfully")
+                logger.info(f"Beets processing completed for {track_path}")
 
         except Exception as e:
-            self.to_screen(f"Failed to run beets: {str(e)}")
+            logger.error(f"Failed to run beets for {track_path}: {str(e)}")
         finally:
             # Clean up temporary config file
             if os.path.exists(temp_config_path):

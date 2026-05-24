@@ -6,6 +6,10 @@ from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
 from ytmusicapi.auth.oauth.credentials import OAuthCredentials
 from postprocessors import BeetsPostProcessor
+from logger_setup import setup_logger
+
+# Initialize logger
+logger = setup_logger("Orpheus")
 
 # load environment variables
 load_dotenv()
@@ -139,7 +143,7 @@ class Orpheus:
         cookies_path = os.path.join(os.getcwd(), "cookies.txt")
         if os.path.exists(cookies_path):
             opts["cookiefile"] = cookies_path
-            print(f"Using cookies from: {cookies_path}")
+            logger.info(f"Using cookies from: {cookies_path}")
 
         return opts
 
@@ -147,7 +151,7 @@ class Orpheus:
         tracks = playlist.get("tracks", [])
         base_url = "https://www.youtube.com/watch?v="
 
-        print(f"Processing {len(tracks)} from playlist {playlist.get('title')}")
+        logger.info(f"Processing {len(tracks)} tracks from playlist {playlist.get('title')}")
         with YoutubeDL(self.get_ydl_opts()) as ydl:
             ydl.add_post_processor(BeetsPostProcessor())
             for track in tracks:
@@ -182,7 +186,7 @@ class Orpheus:
 
         missing_tracks = local_tracks - upstream_tracks
 
-        print(f"Removing {len(missing_tracks)} from playlist {playlist.get('title')}")
+        logger.info(f"Removing {len(missing_tracks)} tracks from playlist {playlist.get('title')}")
 
         # Only scan directory if there are actually missing tracks to remove
         if missing_tracks:
@@ -195,9 +199,9 @@ class Orpheus:
                                 os.remove(entry.path)
                                 if track_id in self.archive:
                                     self.archive.remove(track_id)
-                                print(f"Deleted: {entry.path}")
+                                logger.info(f"Deleted: {entry.path}")
                             except Exception as e:
-                                print(f"Error deleting {entry.path}: {e}")
+                                logger.error(f"Error deleting {entry.path}: {e}")
                     else:
                         pass
 
@@ -205,7 +209,7 @@ class Orpheus:
 
     def cleanup_removed_playlists(self) -> None:
         """Removes local .m3u8 files that are no longer in the upstream library."""
-        print("Cleaning up removed playlists...")
+        logger.info("Cleaning up removed playlists...")
         try:
             upstream_playlists = self.get_playlists()
             upstream_titles = {
@@ -228,10 +232,10 @@ class Orpheus:
                         try:
                             file_path = os.path.join(path, m3u8_file)
                             os.remove(file_path)
-                            print(
+                            logger.info(
                                 f"Removed local playlist file (not found upstream): {file_path}"
                             )
                         except Exception as e:
-                            print(f"Error removing playlist file {file_path}: {e}")
+                            logger.error(f"Error removing playlist file {file_path}: {e}")
         except Exception as e:
-            print(f"Error during playlist cleanup: {e}")
+            logger.error(f"Error during playlist cleanup: {e}")
