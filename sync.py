@@ -49,6 +49,17 @@ def main():
         except Exception as e:
             logger.error(f"Error syncing playlist {title}: {e}")
 
+    # Regenerate custom blends now that their source playlists are up to date
+    blends = orp.load_blends()
+    if blends:
+        logger.info(f"Updating {len(blends)} custom blend(s)...")
+        for name in blends:
+            try:
+                orp.update_local_blend(name)
+                logger.info(f"Updated blend: {name}")
+            except Exception as e:
+                logger.error(f"Error updating blend {name}: {e}")
+
     logger.info("Performing final cleanup...")
     try:
         orp.cleanup_removed_playlists()

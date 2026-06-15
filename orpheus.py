@@ -376,6 +376,9 @@ class Orpheus:
             upstream_titles = {
                 p.get("title") for p in upstream_playlists if p.get("title")
             }
+            # Local blends have no upstream counterpart — keep them so they
+            # aren't deleted just for not being a YouTube Music playlist.
+            keep_titles = upstream_titles | set(self.load_blends().keys())
 
             # Cleanup all playlist directories
             for path in [
@@ -389,7 +392,7 @@ class Orpheus:
 
                 for m3u8_file in local_m3u8_files:
                     playlist_title = os.path.splitext(m3u8_file)[0]
-                    if playlist_title not in upstream_titles:
+                    if playlist_title not in keep_titles:
                         try:
                             file_path = os.path.join(path, m3u8_file)
                             os.remove(file_path)
