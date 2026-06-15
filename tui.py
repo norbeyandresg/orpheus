@@ -14,8 +14,16 @@ Keys:
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import select
+import sys
+import termios
+import tty
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import readchar
 from art import text2art
@@ -49,6 +57,99 @@ GREEN_RGB = (74, 222, 128)
 CYAN_RGB = (34, 211, 238)
 
 K = readchar.key
+
+
+def _orpheus_logger_names() -> set:
+    names = {"Orpheus", "OrpheusPP", "OrpheusUI", "OrpheusTUI", "OrpheusSync"}
+    names |= {n for n in logging.Logger.manager.loggerDict if n.startswith("Orpheus")}
+    return names
+
+
+def silence_console_logging() -> None:
+    """Detach stdout/console handlers from every Orpheus logger so download
+    output (yt-dlp routes through the logger, beets logs, etc.) can't scroll
+    and corrupt the full-screen UI. Rotating file handlers are kept, so
+    orpheus.log still records everything.
+    """
+    for name in _orpheus_logger_names():
+        lg = logging.getLogger(name)
+        for h in list(lg.handlers):
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                lg.removeHandler(h)
+
+
+class _BufferLogHandler(logging.Handler):
+    """Appends (levelno, formatted message) tuples to a bounded buffer that the
+    TUI renders in its Logs panel, and triggers a redraw so log lines appear in
+    real time during a (synchronous, single-threaded) download."""
+
+    def __init__(self, buffer: "Deque", on_emit=None) -> None:
+        super().__init__()
+        self.buffer = buffer
+        self.on_emit = on_emit
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.buffer.append((record.levelno, self.format(record)))
+        except Exception:
+            return
+        if self.on_emit is not None:
+            with contextlib.suppress(Exception):
+                self.on_emit()
+
+
+def attach_log_capture(buffer: "Deque", on_emit=None) -> None:
+    """Route every Orpheus logger (incl. yt-dlp, which logs through the Orpheus
+    logger when quiet) into the in-memory buffer for the Logs panel. ``on_emit``
+    is called after each record so the UI can redraw immediately."""
+    handler = _BufferLogHandler(buffer, on_emit)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
+    for name in _orpheus_logger_names():
+        logging.getLogger(name).addHandler(handler)
+
+
+@contextlib.contextmanager
+def raw_terminal():
+    """Hold the terminal in cbreak mode for the whole session.
+
+    Keeping non-canonical, no-echo mode active for the entire app (not just
+    while reading a key) means keystrokes during a long blocking download
+    don't echo as raw escape codes (e.g. ^[[B) or corrupt the display. cbreak
+    leaves signals enabled so Ctrl-C still interrupts a running sync.
+    """
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd, termios.TCSANOW)
+        yield fd
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def read_key(fd: Optional[int] = None) -> str:
+    """Read a single keypress. Assumes the terminal is already in cbreak/raw
+    mode (see ``raw_terminal``).
+
+    A lone Esc returns immediately instead of blocking to see whether it begins
+    an escape sequence: after reading Esc we poll briefly for follow-up bytes
+    (arrow keys send ``\\x1b[A`` etc.), reading them non-blocking so a lone Esc
+    can never hang, and return just ``\\x1b`` when none arrive.
+    """
+    if fd is None:
+        fd = sys.stdin.fileno()
+    ch = os.read(fd, 1).decode("utf-8", "ignore")
+    if ch == "\x1b":
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if ready:
+            os.set_blocking(fd, False)
+            try:
+                ch += os.read(fd, 6).decode("utf-8", "ignore")
+            except (BlockingIOError, OSError):
+                pass
+            finally:
+                os.set_blocking(fd, True)
+    return ch
 
 
 def _lerp(a: int, b: int, t: float) -> int:
@@ -105,6 +206,7 @@ MASCOT = r"""
 @dataclass
 class SyncProgress:
     active: bool = False
+    queue: List[str] = field(default_factory=list)  # playlist titles, in order
     playlists_done: int = 0
     playlists_total: int = 0
     current: str = ""
@@ -119,6 +221,7 @@ class AppState:
     status: str = "Ready."
     progress: SyncProgress = field(default_factory=SyncProgress)
     overlay: Optional[object] = None  # a renderable shown as a modal
+    logs: Deque = field(default_factory=lambda: deque(maxlen=200))
     running: bool = True
 
 
@@ -149,7 +252,10 @@ def render_splash() -> Group:
 
 
 def render_menu(state: AppState) -> Panel:
-    grid = Table.grid(padding=(0, 0))
+    # Compact rows (no blank spacers) so the menu fits alongside the status +
+    # logs panels even on shorter terminals; the panel centers it with air
+    # around the block on taller ones.
+    grid = Table.grid(padding=(0, 1))
     grid.add_column()
     for i, item in enumerate(MENU):
         selected = i == state.menu_sel
@@ -164,8 +270,6 @@ def render_menu(state: AppState) -> Panel:
             line.append(f"{item['label']:<14}   ", style="bold")
             line.append(item["desc"], style=DIM)
         grid.add_row(line)
-        if i != len(MENU) - 1:
-            grid.add_row("")
 
     def _plural(n: int, word: str) -> str:
         return f"{n} {word}" + ("" if n == 1 else "s")
@@ -189,49 +293,117 @@ def render_menu(state: AppState) -> Panel:
 
 
 def render_status(state: AppState) -> Panel:
-    p = state.progress
-    if p.active:
-        grid = Table.grid(padding=(0, 1), expand=True)
-        grid.add_column(width=18)
-        grid.add_column(ratio=1)
-        grid.add_column(justify="right", width=16, style=DIM)
-
-        overall = ProgressBar(
-            total=max(1, p.playlists_total),
-            completed=p.playlists_done,
-            complete_style=ACCENT,
-            finished_style=OK,
-        )
-        grid.add_row(
-            Text("Sync", style=f"bold {ACCENT}"),
-            overall,
-            f"{p.playlists_done}/{p.playlists_total} playlists",
-        )
-
-        track = ProgressBar(
-            total=max(1, p.tracks_total),
-            completed=p.tracks_done,
-            complete_style=ACCENT2,
-            finished_style=OK,
-        )
-        label = Text(f"  └ {p.current}", style=DIM, no_wrap=True, overflow="ellipsis")
-        grid.add_row(label, track, f"{p.tracks_done}/{p.tracks_total} tracks")
-        return Panel(
-            grid, box=ROUNDED, border_style=ACCENT2,
-            title="[bold]Syncing[/]", title_align="left",
-        )
-
+    """Idle status line. (Sync progress is shown by render_sync_view instead.)"""
     return Panel(
         Text(state.status, style=DIM), box=ROUNDED,
         border_style=IDLE_BORDER, title="Status", title_align="left",
     )
 
 
-def render_footer() -> Panel:
-    keys: List[Tuple[str, str]] = [
-        ("j/k", "move"), ("g/G", "top/btm"), ("↵", "select"),
-        ("r", "refresh"), ("q", "quit"),
-    ]
+def render_sync_view(state: AppState) -> Panel:
+    """Full-body progress display shown while a sync runs (replaces the menu)."""
+    p = state.progress
+    bar_w = 46
+
+    bars = Table.grid(padding=(0, 2))
+    bars.add_column(width=10, justify="right")
+    bars.add_column(width=bar_w)
+    bars.add_column(justify="left", style=DIM)
+    bars.add_row(
+        Text("Playlists", style=f"bold {ACCENT}"),
+        ProgressBar(total=max(1, p.playlists_total), completed=p.playlists_done,
+                    width=bar_w, complete_style=ACCENT, finished_style=OK),
+        f"{p.playlists_done}/{p.playlists_total}",
+    )
+    bars.add_row(
+        Text("Tracks", style=f"bold {ACCENT2}"),
+        ProgressBar(total=max(1, p.tracks_total), completed=p.tracks_done,
+                    width=bar_w, complete_style=ACCENT2, finished_style=OK),
+        f"{p.tracks_done}/{p.tracks_total}",
+    )
+
+    # Queue: ✓ done · ▸ current · ○ pending. Window it so a long full-sync
+    # list stays bounded and the current item is always visible.
+    queue = Table.grid(padding=(0, 0))
+    queue.add_column()
+    n = len(p.queue)
+    window = 10
+    if n <= window:
+        start, end = 0, n
+    else:
+        start = max(0, min(p.playlists_done - 3, n - window))
+        end = start + window
+    if start > 0:
+        queue.add_row(Text(f"   … {start} more above", style=DIM))
+    for i in range(start, end):
+        name = p.queue[i]
+        if i < p.playlists_done:
+            line = Text(f"   ✓  {name}", style=OK)
+        elif i == p.playlists_done:
+            tail = f"   ({p.tracks_done}/{p.tracks_total})" if p.tracks_total else ""
+            line = Text(f"   ▸  {name}{tail}", style=f"bold {ACCENT}")
+        else:
+            line = Text(f"   ○  {name}", style=DIM)
+        queue.add_row(line)
+    if end < n:
+        queue.add_row(Text(f"   … {n - end} more below", style=DIM))
+
+    done = p.playlists_done
+    total = p.playlists_total
+    body = Group(
+        Align.center(Text(f"⟳  downloading  {p.current}", style=f"bold {ACCENT}",
+                          no_wrap=True, overflow="ellipsis")),
+        Text(""),
+        Align.center(bars),
+        Text(""),
+        Text(f"  Queue   [{done} done · {total - done} remaining]", style=f"bold {DIM}"),
+        queue,
+        Text(""),
+        Align.center(Text("Ctrl-C to cancel", style=DIM)),
+    )
+    return Panel(
+        body,
+        title="[bold]Syncing[/]",
+        title_align="left",
+        border_style=ACCENT2,
+        box=ROUNDED,
+        padding=(1, 2),
+    )
+
+
+def render_logs(state: AppState, max_lines: int = 6) -> Panel:
+    """Tail of the captured yt-dlp/backend logs; warnings and errors stand out."""
+    grid = Table.grid()
+    grid.add_column()
+    entries = list(state.logs)[-max_lines:]
+    if not entries:
+        grid.add_row(Text("no activity yet", style=DIM))
+    n_warn = sum(1 for lvl, _ in state.logs if lvl >= logging.WARNING)
+    for levelno, msg in entries:
+        if levelno >= logging.ERROR:
+            style = "bold red"
+        elif levelno >= logging.WARNING:
+            style = "yellow"
+        else:
+            style = DIM
+        grid.add_row(Text(msg, style=style, no_wrap=True, overflow="ellipsis"))
+
+    title = "Logs"
+    if n_warn:
+        title = f"Logs  [yellow]({n_warn} warning/error)[/]"
+    return Panel(
+        grid, title=title, title_align="left",
+        border_style=IDLE_BORDER, box=ROUNDED, padding=(0, 1),
+    )
+
+
+def render_footer(syncing: bool = False) -> Panel:
+    keys: List[Tuple[str, str]] = (
+        [("Ctrl-C", "cancel sync")]
+        if syncing
+        else [("j/k", "move"), ("g/G", "top/btm"), ("↵", "select"),
+              ("r", "refresh"), ("q", "quit")]
+    )
     text = Text()
     for i, (k, label) in enumerate(keys):
         if i:
@@ -242,12 +414,24 @@ def render_footer() -> Panel:
 
 
 def build_layout(state: AppState, width: int, height: int) -> Layout:
-    status_size = 4
     root = Layout()
+
+    # While syncing there's nothing to navigate — hand the whole body to the
+    # progress view and drop the menu + separate status panel.
+    if state.progress.active:
+        root.split_column(
+            Layout(render_header(), name="header", size=6),
+            Layout(render_sync_view(state), name="body", ratio=1),
+            Layout(render_logs(state), name="logs", size=8),
+            Layout(render_footer(syncing=True), name="footer", size=3),
+        )
+        return root
+
     root.split_column(
         Layout(render_header(), name="header", size=6),
         Layout(name="body", ratio=1),
-        Layout(render_status(state), name="status", size=status_size),
+        Layout(render_status(state), name="status", size=4),
+        Layout(render_logs(state), name="logs", size=8),
         Layout(render_footer(), name="footer", size=3),
     )
     if state.overlay is not None:
@@ -288,7 +472,7 @@ class _Loop:
         idx = 0
         while True:
             self._show_overlay(_menu_panel(title, options, idx, hint="↵ select · esc cancel"))
-            key = readchar.readkey()
+            key = read_key()
             if key in (K.DOWN, "j"):
                 idx = (idx + 1) % len(options)
             elif key in (K.UP, "k"):
@@ -310,7 +494,7 @@ class _Loop:
                 _menu_panel(title, options, idx, chosen=chosen,
                             hint="space toggle · ↵ confirm · esc cancel")
             )
-            key = readchar.readkey()
+            key = read_key()
             if key in (K.DOWN, "j"):
                 idx = (idx + 1) % len(options)
             elif key in (K.UP, "k"):
@@ -337,7 +521,7 @@ class _Loop:
                 subtitle="↵ confirm · esc cancel", subtitle_align="right",
             )
             self._show_overlay(panel)
-            key = readchar.readkey()
+            key = read_key()
             if key in (K.ENTER, "\r", "\n"):
                 self._clear_overlay()
                 return buf.strip()
@@ -358,7 +542,7 @@ class _Loop:
         )
         self._show_overlay(panel)
         while True:
-            key = readchar.readkey()
+            key = read_key()
             if key in ("y", "Y"):
                 self._clear_overlay()
                 return True
@@ -415,18 +599,22 @@ def _entry_options(entries: List[dict]) -> List[Tuple[str, str]]:
     ]
 
 
-def _run_sync(loop: _Loop, orp: Orpheus, playlist_ids: List[str]) -> None:
+def _run_sync(loop: _Loop, orp: Orpheus, targets: List[Tuple[str, str]]) -> None:
+    """targets: ordered list of (title, playlistId) to sync."""
     p = loop.state.progress
     p.active = True
-    p.playlists_total = len(playlist_ids)
+    p.queue = [title for title, _ in targets]
+    p.playlists_total = len(targets)
     p.playlists_done = 0
     try:
-        for pid in playlist_ids:
-            playlist = orp.get_playlist_details(pid)
-            title = playlist.get("title", "default")
+        for title, pid in targets:
             p.current = title
-            p.tracks_total = len(playlist.get("tracks", []))
             p.tracks_done = 0
+            p.tracks_total = 0
+            loop.refresh()
+
+            playlist = orp.get_playlist_details(pid)
+            p.tracks_total = len(playlist.get("tracks", []))
             loop.refresh()
 
             def on_progress(done: int, total: int) -> None:
@@ -439,11 +627,15 @@ def _run_sync(loop: _Loop, orp: Orpheus, playlist_ids: List[str]) -> None:
             p.playlists_done += 1
             loop.refresh()
         orp.cleanup_removed_playlists()
-        loop.state.status = f"Synced {len(playlist_ids)} playlist(s)."
+        loop.state.status = f"Synced {len(targets)} playlist(s)."
     except KeyboardInterrupt:
         loop.state.status = "Sync cancelled."
     finally:
         p.active = False
+        # discard any keys typed during the (blocking) download so they don't
+        # replay as a burst of menu navigation afterwards
+        with contextlib.suppress(Exception):
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
         _refresh_entries(loop, orp)
 
 
@@ -452,9 +644,10 @@ def action_sync(loop: _Loop, orp: Orpheus) -> None:
     loop.refresh()
     playlists = orp.get_playlists()
     options = [(p.get("title", "?"), p.get("playlistId")) for p in playlists]
+    title_by_id = {p.get("playlistId"): p.get("title", "?") for p in playlists}
     selected = loop.select_many("Sync — pick playlists", options)
     if selected:
-        _run_sync(loop, orp, selected)
+        _run_sync(loop, orp, [(title_by_id.get(pid, pid), pid) for pid in selected])
 
 
 def action_full_sync(loop: _Loop, orp: Orpheus) -> None:
@@ -462,8 +655,8 @@ def action_full_sync(loop: _Loop, orp: Orpheus) -> None:
         return
     loop.state.status = "Loading upstream playlists…"
     loop.refresh()
-    ids = [p.get("playlistId") for p in orp.get_playlists()]
-    _run_sync(loop, orp, ids)
+    targets = [(p.get("title", "?"), p.get("playlistId")) for p in orp.get_playlists()]
+    _run_sync(loop, orp, targets)
 
 
 def action_blend(loop: _Loop, orp: Orpheus) -> None:
@@ -562,26 +755,30 @@ def handle_key(key: str, loop: _Loop, orp: Orpheus) -> None:
 
 
 def run(orp: Orpheus) -> None:
+    silence_console_logging()
     console = Console()
     state = AppState(entries=load_entries(orp))
-    with Live(console=console, screen=True, auto_refresh=False,
-              redirect_stdout=False, redirect_stderr=False) as live:
+    with raw_terminal() as fd, Live(console=console, screen=True,
+                                    auto_refresh=False, redirect_stdout=False,
+                                    redirect_stderr=False) as live:
         # splash screen — any key (except q) enters the dashboard
         live.update(Align.center(render_splash(), vertical="middle"), refresh=True)
         try:
-            if readchar.readkey() in ("q", "\x03"):
+            if read_key(fd) in ("q", "\x03"):
                 return
         except KeyboardInterrupt:
             return
 
         loop = _Loop(live, console, state)
+        # capture logs into the panel and redraw on each record (real-time)
+        attach_log_capture(state.logs, loop.refresh)
         loop.refresh()
         while state.running:
             try:
-                key = readchar.readkey()
+                key = read_key(fd)
+                handle_key(key, loop, orp)
             except KeyboardInterrupt:
                 break
-            handle_key(key, loop, orp)
             if state.running:
                 loop.refresh()
 

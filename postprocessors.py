@@ -91,7 +91,7 @@ class BeetsPostProcessor(postprocessor.PostProcessor):
                 track_path,
             ]
             
-            self.to_screen(f"Executing: {' '.join(cmd)}")
+            logger.debug(f"Executing: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=False
             )
