@@ -44,7 +44,57 @@ STAR = "yellow"
 DIM = "grey42"
 IDLE_BORDER = "grey37"
 
+# gradient endpoints (green → cyan) for the logo/mascot
+GREEN_RGB = (74, 222, 128)
+CYAN_RGB = (34, 211, 238)
+
 K = readchar.key
+
+
+def _lerp(a: int, b: int, t: float) -> int:
+    return int(a + (b - a) * t)
+
+
+def gradient(text: str, c1=GREEN_RGB, c2=CYAN_RGB) -> Text:
+    """Color each character left→right, interpolating between two RGB colors."""
+    lines = text.split("\n")
+    width = max((len(line) for line in lines), default=1)
+    out = Text()
+    for li, line in enumerate(lines):
+        for x, ch in enumerate(line):
+            f = x / max(1, width - 1)
+            r, g, b = _lerp(c1[0], c2[0], f), _lerp(c1[1], c2[1], f), _lerp(c1[2], c2[2], f)
+            out.append(ch, style=f"#{r:02x}{g:02x}{b:02x}")
+        if li != len(lines) - 1:
+            out.append("\n")
+    return out
+
+
+# Startup mascot (shown on the splash screen)
+MASCOT = r"""
+             ,,,,,,,,
+           ,|||````||||
+     ,,,,|||||       ||,
+  ,||||```````       `||
+,|||`                 |||,
+||`     ....,          `|||
+||     ::::::::          |||,
+||     :::::::'     ||    ``|||,
+||,     :::::'               `|||
+`||,                           |||
+ `|||,       ||          ||    ,||
+   `||                        |||`
+    ||                   ,,,||||
+    ||              ,||||||```
+   ,||         ,,|||||`
+  ,||`   ||   |||`
+ |||`         ||
+,||           ||
+||`           ||
+|||,         |||
+ `|||,,    ,|||
+   ``||||||||`
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -78,12 +128,24 @@ class AppState:
 
 
 def render_header() -> Panel:
-    logo = text2art("Orpheus", font="small").rstrip("\n")
-    body = Group(
-        Text(logo, style=f"bold {ACCENT}"),
-        Text("youtube music · sync & blend", style=DIM),
-    )
+    logo = gradient(text2art("Orpheus", font="small").rstrip("\n"))
+    body = Group(logo, Text("youtube music · sync & blend", style=DIM))
     return Panel(body, box=ROUNDED, border_style=ACCENT, padding=(0, 2))
+
+
+def render_splash() -> Group:
+    """Full mascot + logo banner shown once on startup."""
+    mascot = gradient(MASCOT.strip("\n"))
+    logo = gradient(text2art("Orpheus", font="slant").rstrip("\n"))
+    return Group(
+        Text("\n\n"),  # top padding
+        Align.center(mascot),
+        Text(""),
+        Align.center(logo),
+        Align.center(Text("▶ sync & blend your library", style=f"bold {OK}")),
+        Text(""),
+        Align.center(Text("press any key to start", style=DIM)),
+    )
 
 
 def render_menu(state: AppState) -> Panel:
@@ -504,6 +566,14 @@ def run(orp: Orpheus) -> None:
     state = AppState(entries=load_entries(orp))
     with Live(console=console, screen=True, auto_refresh=False,
               redirect_stdout=False, redirect_stderr=False) as live:
+        # splash screen — any key (except q) enters the dashboard
+        live.update(Align.center(render_splash(), vertical="middle"), refresh=True)
+        try:
+            if readchar.readkey() in ("q", "\x03"):
+                return
+        except KeyboardInterrupt:
+            return
+
         loop = _Loop(live, console, state)
         loop.refresh()
         while state.running:
@@ -514,6 +584,13 @@ def run(orp: Orpheus) -> None:
             handle_key(key, loop, orp)
             if state.running:
                 loop.refresh()
+
+
+def preview_banner() -> None:
+    """Print the startup banner to the terminal (no app, no auth) so you can
+    see it in full color:  python -c 'import tui; tui.preview_banner()'
+    """
+    Console().print(render_splash())
 
 
 def main() -> None:
