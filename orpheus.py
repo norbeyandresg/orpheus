@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from typing import Dict, List, Set
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
@@ -54,8 +55,34 @@ class Orpheus:
         os.makedirs(self.library_playlist_path, exist_ok=True)
         os.makedirs(self.navidrone_playlist_path, exist_ok=True)
 
+        # registry file tracking combined ("blend") playlists and their sources
+        self.blends_path = os.environ.get(
+            "BLENDS_PATH", os.path.join(os.getcwd(), "blends.json")
+        )
+
         self.archive = set()
         self.m3u8_tracks = []
+
+    def load_blends(self) -> Dict[str, Dict]:
+        """Load the registry of combined ("blend") playlists.
+
+        Returns a mapping of blend name -> {"sources": List[str]}, where each
+        source is the name of an already-downloaded playlist.
+        """
+        if os.path.exists(self.blends_path):
+            try:
+                with open(self.blends_path, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.error(f"Error reading blends registry: {e}")
+        return {}
+
+    def save_blend(self, name: str, source_playlist_names: List[str]) -> None:
+        """Record (or update) a blend's source definition."""
+        blends = self.load_blends()
+        blends[name] = {"sources": source_playlist_names}
+        with open(self.blends_path, "w") as f:
+            json.dump(blends, f, indent=2)
 
     def load_download_archive(self) -> None:
         archive_path = f"{self.library_path}/download_archive.txt"
@@ -73,6 +100,95 @@ class Orpheus:
 
     def get_playlist_details(self, playlist_id: str) -> Dict:
         return self.ytmusic.get_playlist(playlistId=playlist_id, limit=None)
+
+    def get_local_playlists(self) -> List[str]:
+        """Return the names of already-downloaded playlists (from the library
+        .m3u8 files), excluding any registered blends."""
+        if not os.path.exists(self.library_playlist_path):
+            return []
+        blend_names = set(self.load_blends().keys())
+        names = [
+            os.path.splitext(f)[0]
+            for f in os.listdir(self.library_playlist_path)
+            if f.endswith(".m3u8")
+        ]
+        return sorted(n for n in names if n not in blend_names)
+
+    def _parse_m3u8_tracks(self, playlist_name: str) -> List[Dict]:
+        """Parse the library .m3u8 file for a playlist into track dicts of
+        {videoId, title, duration_seconds}."""
+        playlist_file = os.path.join(
+            self.library_playlist_path, f"{playlist_name}.m3u8"
+        )
+        tracks: List[Dict] = []
+        if not os.path.exists(playlist_file):
+            logger.error(f"Playlist file not found: {playlist_file}")
+            return tracks
+
+        title = None
+        duration = "-1"
+        with open(playlist_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line == "#EXTM3U":
+                    continue
+                if line.startswith("#EXTINF:"):
+                    # format: #EXTINF:<duration>,<title>
+                    meta = line[len("#EXTINF:") :]
+                    duration, _, title = meta.partition(",")
+                elif not line.startswith("#"):
+                    video_id = os.path.splitext(os.path.basename(line))[0]
+                    tracks.append(
+                        {
+                            "videoId": video_id,
+                            "title": title,
+                            "duration_seconds": duration,
+                        }
+                    )
+                    title, duration = None, "-1"
+        return tracks
+
+    def combine_local_playlists(
+        self, name: str, source_playlist_names: List[str]
+    ) -> None:
+        """Create a new blend .m3u8 by mixing already-downloaded playlists.
+
+        Tracks are merged across the source playlists, de-duplicated by
+        videoId while preserving first-seen order, then written out in all
+        three .m3u8 variants under the blend ``name``.
+        """
+        seen: Set[str] = set()
+        combined: List[Dict] = []
+
+        for source in source_playlist_names:
+            logger.info(f"Mixing in tracks from playlist: {source}")
+            for track in self._parse_m3u8_tracks(source):
+                video_id = track.get("videoId")
+                if video_id and video_id not in seen:
+                    seen.add(video_id)
+                    combined.append(track)
+
+        logger.info(f"Creating blend '{name}' with {len(combined)} tracks")
+        self.m3u8_tracks = combined
+        self.create_m3u8_playlist_file(name)
+        self.save_blend(name, source_playlist_names)
+
+    def update_local_blend(
+        self, name: str, source_playlist_names: List[str] | None = None
+    ) -> None:
+        """Regenerate an existing blend from its (possibly updated) source
+        playlists. If ``source_playlist_names`` is omitted, the sources
+        recorded in the blends registry are used."""
+        if source_playlist_names is None:
+            blend = self.load_blends().get(name)
+            if not blend:
+                raise ValueError(
+                    f"No recorded sources for blend '{name}'; "
+                    "pass source_playlist_names explicitly."
+                )
+            source_playlist_names = blend.get("sources", [])
+
+        self.combine_local_playlists(name, source_playlist_names)
 
     def create_m3u8_playlist_file(self, playlist_name: str) -> None:
         # Generate Fiio version
