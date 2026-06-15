@@ -1,7 +1,7 @@
 import os
 import re
 import json
-from typing import Dict, List, Set
+from typing import Callable, Dict, List, Optional, Set
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
@@ -225,7 +225,7 @@ class Orpheus:
 
         self.m3u8_tracks = []
 
-    def get_ydl_opts(self) -> Dict:
+    def get_ydl_opts(self, quiet: bool = False) -> Dict:
         opts = {
             "format": "bestaudio/best",
             "outtmpl": f"{self.library_path}/%(id)s.%(ext)s",
@@ -261,16 +261,36 @@ class Orpheus:
             opts["cookiefile"] = cookies_path
             logger.info(f"Using cookies from: {cookies_path}")
 
+        # In quiet mode (the TUI) keep yt-dlp off stdout, which would corrupt a
+        # full-screen display. Route its output to our logger instead.
+        if quiet:
+            opts["quiet"] = True
+            opts["no_warnings"] = True
+            opts["noprogress"] = True
+            opts["logger"] = logger
+
         return opts
 
-    def download_playlist_tracks(self, playlist: dict) -> None:
+    def download_playlist_tracks(
+        self,
+        playlist: dict,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        quiet: bool = False,
+    ) -> None:
+        """Download every track in ``playlist``.
+
+        ``on_progress`` (if given) is called with (completed, total) after each
+        track so a caller such as the TUI can render a progress bar. ``quiet``
+        suppresses yt-dlp's own stdout output.
+        """
         tracks = playlist.get("tracks", [])
+        total = len(tracks)
         base_url = "https://www.youtube.com/watch?v="
 
-        logger.info(f"Processing {len(tracks)} tracks from playlist {playlist.get('title')}")
-        with YoutubeDL(self.get_ydl_opts()) as ydl:
+        logger.info(f"Processing {total} tracks from playlist {playlist.get('title')}")
+        with YoutubeDL(self.get_ydl_opts(quiet=quiet)) as ydl:
             ydl.add_post_processor(BeetsPostProcessor())
-            for track in tracks:
+            for index, track in enumerate(tracks, start=1):
                 ydl.download(f"{base_url}{track.get('videoId')}")
                 # Store track metadata for playlist generation
                 self.m3u8_tracks.append(
@@ -280,6 +300,31 @@ class Orpheus:
                         "duration_seconds": track.get("duration_seconds", "-1"),
                     }
                 )
+                if on_progress is not None:
+                    on_progress(index, total)
+
+    def remove_playlist(self, name: str) -> None:
+        """Delete a playlist/blend's local .m3u8 files from every variant
+        directory and drop it from the blends registry if present."""
+        for path in (
+            self.fiio_playlist_path,
+            self.library_playlist_path,
+            self.navidrone_playlist_path,
+        ):
+            playlist_file = os.path.join(path, f"{name}.m3u8")
+            if os.path.exists(playlist_file):
+                try:
+                    os.remove(playlist_file)
+                    logger.info(f"Removed playlist file: {playlist_file}")
+                except OSError as e:
+                    logger.error(f"Error removing {playlist_file}: {e}")
+
+        blends = self.load_blends()
+        if name in blends:
+            del blends[name]
+            with open(self.blends_path, "w") as f:
+                json.dump(blends, f, indent=2)
+            logger.info(f"Removed blend '{name}' from registry")
 
     def cleanup_missing_tracks_from_playlist(self, playlist: dict) -> None:
         self.load_download_archive()
