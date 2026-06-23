@@ -197,35 +197,46 @@ class Orpheus:
                 return p
         return None
 
-    def resolve_tracks_to_ytmusic(self, tracks: List[Dict]) -> List[Dict]:
+    def resolve_tracks_to_ytmusic(
+        self,
+        tracks: List[Dict],
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> List[Dict]:
         """Resolve (artist, title) pairs to YouTube Music songs via search.
 
         Returns {videoId, title, artist} for each track that matched; misses
         are logged and skipped. Used to turn a ListenBrainz playlist (which has
         no YouTube ids) into something we can push to a YouTube Music playlist.
+
+        ``on_progress`` (if given) is called with (attempted, total) after each
+        track so a caller such as the TUI can render a progress bar.
         """
         resolved: List[Dict] = []
-        for t in tracks:
+        total = len(tracks)
+        for index, t in enumerate(tracks, start=1):
             query = f"{t.get('artist', '')} {t.get('title', '')}".strip()
             try:
                 results = self.ytmusic.search(query, filter="songs", limit=1)
+                if not results:
+                    logger.warning(f"No YouTube Music match for '{query}'")
+                else:
+                    hit = results[0]
+                    resolved.append(
+                        {
+                            "videoId": hit.get("videoId"),
+                            "title": hit.get("title"),
+                            "artist": ", ".join(
+                                a["name"]
+                                for a in hit.get("artists", [])
+                                if a.get("name")
+                            ),
+                        }
+                    )
             except Exception as e:
                 logger.warning(f"Search failed for '{query}': {e}")
-                continue
-            if not results:
-                logger.warning(f"No YouTube Music match for '{query}'")
-                continue
-            hit = results[0]
-            resolved.append(
-                {
-                    "videoId": hit.get("videoId"),
-                    "title": hit.get("title"),
-                    "artist": ", ".join(
-                        a["name"] for a in hit.get("artists", []) if a.get("name")
-                    ),
-                }
-            )
-        logger.info(f"Resolved {len(resolved)}/{len(tracks)} tracks on YouTube Music")
+            if on_progress is not None:
+                on_progress(index, total)
+        logger.info(f"Resolved {len(resolved)}/{total} tracks on YouTube Music")
         return resolved
 
     def overwrite_ytmusic_playlist(self, name: str, video_ids: List[str]) -> Dict:

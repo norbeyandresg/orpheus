@@ -212,6 +212,9 @@ class SyncProgress:
     current: str = ""
     tracks_done: int = 0
     tracks_total: int = 0
+    title: str = "Syncing"        # panel title
+    verb: str = "downloading"     # gerund shown next to the current item
+    unit_label: str = "Tracks"    # label for the per-item progress bar
 
 
 @dataclass
@@ -318,7 +321,7 @@ def render_sync_view(state: AppState) -> Panel:
         f"{p.playlists_done}/{p.playlists_total}",
     )
     bars.add_row(
-        Text("Tracks", style=f"bold {ACCENT2}"),
+        Text(p.unit_label, style=f"bold {ACCENT2}"),
         ProgressBar(total=max(1, p.tracks_total), completed=p.tracks_done,
                     width=bar_w, complete_style=ACCENT2, finished_style=OK),
         f"{p.tracks_done}/{p.tracks_total}",
@@ -353,7 +356,7 @@ def render_sync_view(state: AppState) -> Panel:
     done = p.playlists_done
     total = p.playlists_total
     body = Group(
-        Align.center(Text(f"⟳  downloading  {p.current}", style=f"bold {ACCENT}",
+        Align.center(Text(f"⟳  {p.verb}  {p.current}", style=f"bold {ACCENT}",
                           no_wrap=True, overflow="ellipsis")),
         Text(""),
         Align.center(bars),
@@ -365,7 +368,7 @@ def render_sync_view(state: AppState) -> Panel:
     )
     return Panel(
         body,
-        title="[bold]Syncing[/]",
+        title=f"[bold]{p.title}[/]",
         title_align="left",
         border_style=ACCENT2,
         box=ROUNDED,
@@ -645,6 +648,9 @@ def _run_sync(loop: _Loop, orp: Orpheus, targets: List[Tuple[str, str]]) -> None
     """targets: ordered list of (title, playlistId) to sync."""
     p = loop.state.progress
     p.active = True
+    p.title = "Syncing"
+    p.verb = "downloading"
+    p.unit_label = "Tracks"
     p.queue = [title for title, _ in targets]
     p.playlists_total = len(targets)
     p.playlists_done = 0
@@ -822,26 +828,48 @@ def action_weekly_discovery(loop: _Loop, orp: Orpheus) -> None:
     ):
         return
 
-    loop.state.status = f"Resolving {len(tracks)} songs on YouTube Music…"
+    p = loop.state.progress
+    p.active = True
+    p.title = "Overwriting"
+    p.verb = "resolving"
+    p.unit_label = "Songs"
+    p.queue = [target]
+    p.playlists_total = 1
+    p.playlists_done = 0
+    p.current = target
+    p.tracks_done = 0
+    p.tracks_total = len(tracks)
     loop.refresh()
     try:
-        resolved = orp.resolve_tracks_to_ytmusic(tracks)
+        def on_progress(done: int, total: int) -> None:
+            p.tracks_done, p.tracks_total = done, total
+            loop.refresh()
+
+        resolved = orp.resolve_tracks_to_ytmusic(tracks, on_progress=on_progress)
         video_ids = [r["videoId"] for r in resolved if r.get("videoId")]
-        loop.state.status = f"Overwriting '{target}' with {len(video_ids)} songs…"
+
+        p.verb = "overwriting"
         loop.refresh()
         result = orp.overwrite_ytmusic_playlist(target, video_ids)
+        p.playlists_done = 1
+        loop.refresh()
+
+        missed = len(tracks) - len(video_ids)
+        miss_note = f" ({missed} not found)" if missed else ""
+        loop.state.status = (
+            f"Overwrote '{result['playlist']}': removed {result['removed']}, "
+            f"added {result['added']}{miss_note}."
+        )
+    except KeyboardInterrupt:
+        loop.state.status = "Overwrite cancelled."
     except Exception as e:
         loop.state.status = f"Overwrite failed: {e}"
+    finally:
+        p.active = False
+        # discard keys typed during the blocking resolve so they don't replay
+        with contextlib.suppress(Exception):
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
         loop.refresh()
-        return
-
-    missed = len(tracks) - len(video_ids)
-    miss_note = f" ({missed} not found)" if missed else ""
-    loop.state.status = (
-        f"Overwrote '{result['playlist']}': removed {result['removed']}, "
-        f"added {result['added']}{miss_note}."
-    )
-    loop.refresh()
 
 
 # --------------------------------------------------------------------------- #
