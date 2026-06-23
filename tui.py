@@ -9,7 +9,7 @@ Run with:  python tui.py
 Keys:
   j / k or ↓ / ↑   move          g / G   top / bottom
   ↵                run action    r       refresh library
-  s S b u x        shortcuts     q       quit
+  s S w b u x X    shortcuts     q       quit
 """
 
 from __future__ import annotations
@@ -257,17 +257,19 @@ def render_menu(state: AppState) -> Panel:
     # around the block on taller ones.
     grid = Table.grid(padding=(0, 1))
     grid.add_column()
+    # pad every label to the longest one so the description column stays aligned
+    label_w = max(len(item["label"]) for item in MENU)
     for i, item in enumerate(MENU):
         selected = i == state.menu_sel
         if selected:
             line = Text(
-                f"  {item['key']}   {item['label']:<14}   {item['desc']}",
+                f"  {item['key']}   {item['label']:<{label_w}}   {item['desc']}",
                 style=f"bold black on {ACCENT}",
             )
         else:
             line = Text()
             line.append(f"  {item['key']}   ", style=f"bold {ACCENT}")
-            line.append(f"{item['label']:<14}   ", style="bold")
+            line.append(f"{item['label']:<{label_w}}   ", style="bold")
             line.append(item["desc"], style=DIM)
         grid.add_row(line)
 
@@ -533,6 +535,46 @@ class _Loop:
             elif len(key) == 1 and key.isprintable():
                 buf += key
 
+    def show_list(self, title: str, lines: List[str], subtitle: str = "") -> None:
+        """Display a read-only, scrollable list filling the whole body area."""
+        if not lines:
+            lines = ["(empty)"]
+        top = 0
+        while True:
+            # Size the panel to the full body region. The body Layout gets all
+            # space left after the fixed header(6)+status(4)+logs(8)+footer(3),
+            # and the panel's border(2)+padding(2 rows) eat into the visible rows.
+            body_h = max(8, self.console.size.height - 21)
+            window = max(4, body_h - 4)
+            max_top = max(0, len(lines) - window)
+            top = min(top, max_top)
+            visible = lines[top:top + window]
+            counter = ""
+            if len(lines) > window:
+                counter = f"  ·  {top + 1}–{min(top + window, len(lines))} of {len(lines)}"
+            # Explicit full width: the body spans the whole terminal, so matching
+            # the console width leaves the centering wrapper no slack to shrink us.
+            panel = Panel(
+                Text("\n".join(visible), overflow="ellipsis", no_wrap=True),
+                title=f"[bold {ACCENT}]{title}[/]", title_align="left",
+                border_style=ACCENT, box=HEAVY,
+                width=self.console.size.width, height=body_h,
+                padding=(1, 2),
+                subtitle=f"[{DIM}]{subtitle}{counter}  ·  ↑/↓ scroll · esc close[/]",
+                subtitle_align="right",
+            )
+            self._show_overlay(panel)
+            key = read_key()
+            if key in (K.DOWN, "j"):
+                top = min(top + 1, max_top)
+            elif key in (K.UP, "k"):
+                top = max(top - 1, 0)
+            elif key in (K.SPACE, " "):
+                top = min(top + window, max_top)
+            elif key in (K.ENTER, "\r", "\n", K.ESC, "q", "\x03"):
+                self._clear_overlay()
+                return
+
     def confirm(self, question: str) -> bool:
         panel = Panel(
             Text(question, style="bold"),
@@ -655,7 +697,11 @@ def action_full_sync(loop: _Loop, orp: Orpheus) -> None:
         return
     loop.state.status = "Loading upstream playlists…"
     loop.refresh()
-    targets = [(p.get("title", "?"), p.get("playlistId")) for p in orp.get_playlists()]
+    targets = [
+        (p.get("title", "?"), p.get("playlistId"))
+        for p in orp.get_playlists()
+        if not orp.is_ignored_for_sync(p.get("title", ""))
+    ]
     _run_sync(loop, orp, targets)
 
 
@@ -707,6 +753,97 @@ def action_remove(loop: _Loop, orp: Orpheus) -> None:
         _refresh_entries(loop, orp)
 
 
+def action_remove_downloads(loop: _Loop, orp: Orpheus) -> None:
+    entries = loop.state.entries
+    if not entries:
+        loop.state.status = "Nothing to remove."
+        loop.refresh()
+        return
+    name = loop.select_one(
+        "Remove downloads — pick a playlist/blend", _entry_options(entries)
+    )
+    if not name:
+        return
+    if loop.confirm(f"Delete downloaded audio AND playlist files for '{name}'?"):
+        loop.state.status = f"Removing downloads for '{name}'…"
+        loop.refresh()
+        result = orp.remove_playlist_downloads(name)
+        shared = (
+            f" ({result['kept_shared']} kept — shared)"
+            if result["kept_shared"]
+            else ""
+        )
+        loop.state.status = (
+            f"Removed '{name}': deleted {result['deleted']} download(s){shared}."
+        )
+        _refresh_entries(loop, orp)
+
+
+def action_weekly_discovery(loop: _Loop, orp: Orpheus) -> None:
+    loop.state.status = "Fetching weekly discovery from ListenBrainz…"
+    loop.refresh()
+    try:
+        data = orp.get_listenbrainz_weekly_discovery()
+    except Exception as e:  # network / API errors shouldn't kill the TUI
+        loop.state.status = f"ListenBrainz fetch failed: {e}"
+        loop.refresh()
+        return
+    if not data or not data["tracks"]:
+        loop.state.status = "No weekly discovery playlist found on ListenBrainz."
+        loop.refresh()
+        return
+
+    tracks = data["tracks"]
+    lines = []
+    for i, t in enumerate(tracks, 1):
+        line = f"{i:>2}. {t['artist']} — {t['title']}"
+        if t.get("album"):
+            line += f"   ·  {t['album']}"
+        lines.append(line)
+
+    if data["is_current"]:
+        badge = "✓ current week"
+        note = "current week"
+    else:
+        badge = f"⚠ outdated (this week is {data['current_week']})"
+        note = f"OUTDATED — newest is week of {data['week']}, this week is {data['current_week']}"
+
+    loop.show_list(
+        f"Weekly Discovery · week of {data['week']}  ·  {badge}",
+        lines,
+        subtitle=f"{len(tracks)} songs",
+    )
+    loop.state.status = f"Weekly discovery ({note}): {len(tracks)} songs."
+    loop.refresh()
+
+    target = orp.discovery_playlist_name
+    if not loop.confirm(
+        f"Overwrite YouTube Music '{target}' playlist with these {len(tracks)} songs?"
+    ):
+        return
+
+    loop.state.status = f"Resolving {len(tracks)} songs on YouTube Music…"
+    loop.refresh()
+    try:
+        resolved = orp.resolve_tracks_to_ytmusic(tracks)
+        video_ids = [r["videoId"] for r in resolved if r.get("videoId")]
+        loop.state.status = f"Overwriting '{target}' with {len(video_ids)} songs…"
+        loop.refresh()
+        result = orp.overwrite_ytmusic_playlist(target, video_ids)
+    except Exception as e:
+        loop.state.status = f"Overwrite failed: {e}"
+        loop.refresh()
+        return
+
+    missed = len(tracks) - len(video_ids)
+    miss_note = f" ({missed} not found)" if missed else ""
+    loop.state.status = (
+        f"Overwrote '{result['playlist']}': removed {result['removed']}, "
+        f"added {result['added']}{miss_note}."
+    )
+    loop.refresh()
+
+
 # --------------------------------------------------------------------------- #
 # Menu + event loop
 # --------------------------------------------------------------------------- #
@@ -714,9 +851,11 @@ def action_remove(loop: _Loop, orp: Orpheus) -> None:
 MENU = [
     {"key": "s", "label": "Sync playlists", "desc": "pick which playlists to download", "action": action_sync},
     {"key": "S", "label": "Full sync", "desc": "download all upstream playlists", "action": action_full_sync},
+    {"key": "w", "label": "Sync weekly discovery", "desc": "list ListenBrainz weekly exploration", "action": action_weekly_discovery},
     {"key": "b", "label": "Create blend", "desc": "mix downloaded playlists into one", "action": action_blend},
     {"key": "u", "label": "Update blend", "desc": "regenerate a blend from its sources", "action": action_update},
     {"key": "x", "label": "Remove", "desc": "delete a playlist or blend locally", "action": action_remove},
+    {"key": "X", "label": "Remove downloads", "desc": "delete a playlist's downloaded audio + files", "action": action_remove_downloads},
     {"key": "q", "label": "Quit", "desc": "exit Orpheus", "action": None},
 ]
 

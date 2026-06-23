@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import requests
+from datetime import date, timedelta
 from typing import Callable, Dict, List, Optional, Set
 from dotenv import load_dotenv
 from yt_dlp import YoutubeDL
@@ -11,6 +13,8 @@ from logger_setup import setup_logger
 
 # Initialize logger
 logger = setup_logger("Orpheus")
+
+LISTENBRAINZ_API = "https://api.listenbrainz.org/1"
 
 # load environment variables
 load_dotenv()
@@ -60,8 +64,23 @@ class Orpheus:
             "BLENDS_PATH", os.path.join(os.getcwd(), "blends.json")
         )
 
+        # the YouTube Music playlist that "sync weekly discovery" overwrites
+        self.discovery_playlist_name = os.environ.get(
+            "DISCOVERY_PLAYLIST_NAME", "discovery"
+        )
+        # playlists excluded from full/automated sync: the discovery playlist is
+        # overwritten on its own schedule, and "episodes for later" is podcasts.
+        self.sync_ignore = {
+            self.discovery_playlist_name.strip().lower(),
+            "episodes for later",
+        }
+
         self.archive = set()
         self.m3u8_tracks = []
+
+    def is_ignored_for_sync(self, title: str) -> bool:
+        """Whether a playlist should be skipped by full/automated sync."""
+        return (title or "").strip().lower() in self.sync_ignore
 
     def load_blends(self) -> Dict[str, Dict]:
         """Load the registry of combined ("blend") playlists.
@@ -83,6 +102,166 @@ class Orpheus:
         blends[name] = {"sources": source_playlist_names}
         with open(self.blends_path, "w") as f:
             json.dump(blends, f, indent=2)
+
+    @staticmethod
+    def _weekly_source_patch(playlist: Dict) -> Optional[str]:
+        """Pull the troi algorithm source_patch (e.g. 'weekly-exploration') out
+        of a ListenBrainz playlist's JSPF extension block, if present."""
+        return (
+            playlist.get("extension", {})
+            .get("https://musicbrainz.org/doc/jspf#playlist", {})
+            .get("additional_metadata", {})
+            .get("algorithm_metadata", {})
+            .get("source_patch")
+        )
+
+    def get_listenbrainz_weekly_discovery(
+        self, username: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Fetch the most recent ListenBrainz "Weekly Exploration" playlist.
+
+        ListenBrainz generates weekly discovery ("Weekly Exploration") playlists
+        for each user, surfaced on their /recommendations page. This lists the
+        bot-generated "created for you" playlists, picks the newest one whose
+        algorithm source is ``weekly-exploration``, then fetches its tracks
+        (the listing endpoint omits them).
+
+        Returns a dict with ``title``, ``week`` (YYYY-MM-DD), ``playlist_mbid``
+        and ``tracks`` (each {title, artist, album, duration_ms}), or ``None``
+        if the user has no weekly exploration playlist.
+        """
+        username = username or os.environ.get("LISTENBRAINZ_USER", "tom-bombadil")
+
+        resp = requests.get(
+            f"{LISTENBRAINZ_API}/user/{username}/playlists/createdfor",
+            params={"count": 25},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        playlists = [p["playlist"] for p in resp.json().get("playlists", [])]
+
+        weekly = [p for p in playlists if self._weekly_source_patch(p) == "weekly-exploration"]
+        if not weekly:
+            logger.warning(f"No weekly exploration playlist found for '{username}'")
+            return None
+        # API returns newest first; sort by creation date to be explicit.
+        weekly.sort(key=lambda p: p.get("date", ""), reverse=True)
+        summary = weekly[0]
+
+        mbid = summary["identifier"].rstrip("/").split("/")[-1]
+
+        detail = requests.get(f"{LISTENBRAINZ_API}/playlist/{mbid}", timeout=30)
+        detail.raise_for_status()
+        playlist = detail.json()["playlist"]
+
+        tracks = [
+            {
+                "title": t.get("title", "?"),
+                "artist": t.get("creator", "?"),
+                "album": t.get("album", ""),
+                "duration_ms": t.get("duration", 0),
+            }
+            for t in playlist.get("track", [])
+        ]
+
+        week_match = re.search(r"week of (\d{4}-\d{2}-\d{2})", playlist.get("title", ""))
+        week = week_match.group(1) if week_match else playlist.get("date", "")[:10]
+
+        # ListenBrainz keys each weekly playlist to a Monday and regenerates it
+        # Monday morning. Compare against this week's Monday so callers can tell
+        # whether they're looking at the current list or a stale one (e.g. this
+        # week's hasn't been generated yet).
+        today = date.today()
+        current_week = (today - timedelta(days=today.weekday())).isoformat()
+        is_current = week == current_week
+
+        logger.info(
+            f"Weekly discovery for '{username}' (week of {week}, "
+            f"{'current' if is_current else 'outdated'}): {len(tracks)} tracks"
+        )
+        return {
+            "title": playlist.get("title", "Weekly Exploration"),
+            "week": week,
+            "current_week": current_week,
+            "is_current": is_current,
+            "playlist_mbid": mbid,
+            "tracks": tracks,
+        }
+
+    def find_playlist_by_name(self, name: str) -> Optional[Dict]:
+        """Return the library playlist whose title matches `name`
+        (case-insensitive), or None."""
+        target = (name or "").strip().lower()
+        for p in self.ytmusic.get_library_playlists(limit=100):
+            if p.get("title", "").strip().lower() == target:
+                return p
+        return None
+
+    def resolve_tracks_to_ytmusic(self, tracks: List[Dict]) -> List[Dict]:
+        """Resolve (artist, title) pairs to YouTube Music songs via search.
+
+        Returns {videoId, title, artist} for each track that matched; misses
+        are logged and skipped. Used to turn a ListenBrainz playlist (which has
+        no YouTube ids) into something we can push to a YouTube Music playlist.
+        """
+        resolved: List[Dict] = []
+        for t in tracks:
+            query = f"{t.get('artist', '')} {t.get('title', '')}".strip()
+            try:
+                results = self.ytmusic.search(query, filter="songs", limit=1)
+            except Exception as e:
+                logger.warning(f"Search failed for '{query}': {e}")
+                continue
+            if not results:
+                logger.warning(f"No YouTube Music match for '{query}'")
+                continue
+            hit = results[0]
+            resolved.append(
+                {
+                    "videoId": hit.get("videoId"),
+                    "title": hit.get("title"),
+                    "artist": ", ".join(
+                        a["name"] for a in hit.get("artists", []) if a.get("name")
+                    ),
+                }
+            )
+        logger.info(f"Resolved {len(resolved)}/{len(tracks)} tracks on YouTube Music")
+        return resolved
+
+    def overwrite_ytmusic_playlist(self, name: str, video_ids: List[str]) -> Dict:
+        """Replace ALL items in the named YouTube Music playlist with video_ids.
+
+        Removes every existing track, then adds the new ones. Returns a summary
+        dict {playlist, removed, added}. Raises ValueError if no playlist with
+        that name exists.
+        """
+        pl = self.find_playlist_by_name(name)
+        if not pl:
+            raise ValueError(f"No YouTube Music playlist named '{name}'")
+        playlist_id = pl["playlistId"]
+
+        existing = self.ytmusic.get_playlist(playlistId=playlist_id, limit=None)
+        removable = [
+            {"videoId": t["videoId"], "setVideoId": t["setVideoId"]}
+            for t in existing.get("tracks", [])
+            if t.get("videoId") and t.get("setVideoId")
+        ]
+        if removable:
+            self.ytmusic.remove_playlist_items(playlist_id, removable)
+        if video_ids:
+            self.ytmusic.add_playlist_items(
+                playlist_id, videoIds=video_ids, duplicates=True
+            )
+
+        logger.info(
+            f"Overwrote playlist '{pl['title']}': "
+            f"removed {len(removable)}, added {len(video_ids)}"
+        )
+        return {
+            "playlist": pl["title"],
+            "removed": len(removable),
+            "added": len(video_ids),
+        }
 
     def load_download_archive(self) -> None:
         archive_path = f"{self.library_path}/download_archive.txt"
@@ -325,6 +504,58 @@ class Orpheus:
             with open(self.blends_path, "w") as f:
                 json.dump(blends, f, indent=2)
             logger.info(f"Removed blend '{name}' from registry")
+
+    def remove_playlist_downloads(self, name: str) -> Dict:
+        """Delete a playlist's downloaded audio AND its .m3u8 files.
+
+        The playlist's tracks are read from its library .m3u8. Any .mp3 still
+        referenced by another local playlist or blend is kept, so removing one
+        playlist's downloads can't break others. Once the unshared audio is
+        deleted, the playlist definition (all three .m3u8 variants + blend
+        registry entry) is removed too.
+
+        Returns {playlist, deleted, kept_shared}.
+        """
+        own_ids = {
+            t["videoId"] for t in self._parse_m3u8_tracks(name) if t.get("videoId")
+        }
+
+        # video ids referenced by every OTHER local playlist/blend .m3u8
+        protected: Set[str] = set()
+        if os.path.exists(self.library_playlist_path):
+            for f in os.listdir(self.library_playlist_path):
+                other = os.path.splitext(f)[0]
+                if not f.endswith(".m3u8") or other == name:
+                    continue
+                for t in self._parse_m3u8_tracks(other):
+                    if t.get("videoId"):
+                        protected.add(t["videoId"])
+
+        to_delete = own_ids - protected
+        kept_shared = len(own_ids & protected)
+
+        self.load_download_archive()
+        deleted = 0
+        for video_id in to_delete:
+            mp3 = os.path.join(self.library_path, f"{video_id}.mp3")
+            if os.path.exists(mp3):
+                try:
+                    os.remove(mp3)
+                    deleted += 1
+                    logger.info(f"Deleted download: {mp3}")
+                except OSError as e:
+                    logger.error(f"Error deleting {mp3}: {e}")
+            self.archive.discard(video_id)
+        self.update_download_archive()
+
+        # finally drop the playlist definition (all variants + blend registry)
+        self.remove_playlist(name)
+
+        logger.info(
+            f"Removed downloads for '{name}': "
+            f"deleted {deleted}, kept {kept_shared} shared"
+        )
+        return {"playlist": name, "deleted": deleted, "kept_shared": kept_shared}
 
     def cleanup_missing_tracks_from_playlist(self, playlist: dict) -> None:
         self.load_download_archive()

@@ -19,6 +19,12 @@ __pycache__/
 g-creds.json
 oauth.json
 
+# Auth / session secrets and local API captures
+browser.json
+cookies.txt
+headers.json
+playlist.json
+
 # Distribution / packaging
 .Python
 build/

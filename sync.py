@@ -34,7 +34,11 @@ def main():
     for p in upstream_playlists:
         title = p.get("title", "Unknown")
         p_id = p.get("playlistId")
-        
+
+        if orp.is_ignored_for_sync(title):
+            logger.info(f"Skipping ignored playlist: {title}")
+            continue
+
         logger.info(f"--- Syncing Playlist: {title} ({p_id}) ---")
         
         try:
